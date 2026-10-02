@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MEOS Live Results</title>
+<!--
+  MEOS Live Results — single-file viewer for the MeOS Information Server REST API.
+
+  Kiosk display — no header, no controls: just the results, scrolling slowly
+  down, refreshing at the bottom and starting over at the top. Configure via URL:
+
+    meos-live.html?base=http://192.168.1.50:2009&poll=60&speed=8&hold=12
+
+      base   MeOS Information Server address (Services → Information Server,
+             default port 2009; a trailing /meos is stripped automatically)
+      poll   refresh interval in seconds        (default 60)
+      speed  auto-scroll speed in pixels/second (default 8 ≈ one lap of a big
+             results list every ~15-30 min)
+      hold   pause at the bottom before restarting, seconds (default 12)
+
+  Behaviour:
+    - Bootstraps with ?difference=zero (full state), then polls the returned
+      nextdifference every `poll` seconds. An empty MOPDiff means "no change".
+    - One long page grouped by class; rows are updated in place so the scroll
+      position never jumps when data arrives.
+    - The page slowly scrolls down continuously; at the bottom it holds for
+      `hold` seconds, forces a refresh, then glides back to the top and repeats.
+    - If MeOS is unreachable or restarted mid-event, an error strip appears at
+      the top (and disappears again when the connection recovers); if the
+      stream id is lost, it re-bootstraps automatically.
+
+  No dependencies, no build step, works offline from file:// as long as the
+  MeOS server is reachable (it sends Access-Control-Allow-Origin: *).
+-->
+<style>
+  :root { --topbar-h: 64px; --accent: #b3261e; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 15px; color: #1a1a1a; background: #f4f5f7;
+  }
+
+  /* ---- error banner (only visible when something is wrong) -------------- */
+  #banner { display: none; position: sticky; top: 0; z-index: 40;
+            padding: 10px 20px; font-size: 16px; background: #fdecea; color: #7a1c18;
+            border-bottom: 1px solid #f2b8b5; text-align: center; }
+  #banner.show { display: block; }
+
+  /* ---- results ---------------------------------------------------------- */
+  main#results { padding: 0 0 40px; max-width: 1600px; margin: 0 auto; }
+  section.cls { padding: 0 8px; }
+  h2.clshead {
+    position: sticky; top: 0; z-index: 30;
+    margin: 26px 4px 6px; font-size: 20px; color: #fff; background: #2c5878;
+    padding: 6px 12px; border-radius: 6px;
+    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  }
+  h2.clshead .count { font-size: 13px; font-weight: normal; color: #cfe0ee; }
+
+  table { width: calc(100% - 8px); margin: 0 auto; border-collapse: collapse;
+          background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  th { position: sticky; /* not sticky — would fight h2; plain header row */
+       font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em;
+       color: #68737d; background: #eef1f4; padding: 5px 10px; text-align: left; }
+  td { padding: 4px 10px; border-top: 1px solid #edf0f2; font-size: 14.5px; }
+  tbody tr:nth-child(even) td { background: #fafbfc; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.place { width: 3.2rem; font-weight: 600; }
+  td.startcol { width: 5.4rem; color: #414b55; }
+  td.bib { width: 4rem; color: #414b55; font-variant-numeric: tabular-nums; }
+  td.name { font-weight: 500; }
+  td.club { color: #5a6570; font-size: 13.5px; }
+  .members { display: block; font-size: 12px; color: #8b949d; font-weight: normal; margin-top: 1px; }
+
+  tr.prel td.time { color: #a06a00; }
+  tr.forest td, tr.unk td { color: #aab3bc; }
+  tr.forest td.name::after { content: " · in forest"; font-size: 12px; color: #9aa5b0; }
+  td.status { color: var(--accent); font-weight: 600; }
+
+  #empty { text-align: center; color: #7a848e; padding: 90px 20px; font-size: 16px; }
+  #empty .big { font-size: 30px; margin-bottom: 10px; }
+
+  @media (max-width: 700px) {
+    td.club, th.clubhead { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="banner"></div>
+
+<main id="results">
+  <div id="empty"><div class="big">🧭</div><span id="emptyMsg">Waiting for configuration…</span></div>
+</main>
+
+<noscript><p style="padding:20px;text-align:center">This page requires JavaScript.</p></noscript>
+
+<script>
+'use strict';
+/* ===================================================================== *
+ *  MEOS Live Results — MOP (MeOS Online Protocol) client
+ *  Data source: GET <base>/meos?difference=<id|"zero">
+ *  - first call "zero"      -> <MOPComplete nextdifference=N> full state
+ *  - later calls ?difference=N -> <MOPDiff nextdifference=M> changes only
+ *    (empty element = nothing changed; keep using the same id)
+ *  All times in MOP are tenths of a second. st = absolute time after
+ *  midnight on day one; rt = running time. See knowledge-base/02, 03.
+ * ===================================================================== */
+
+/* ---------------------------- settings -------------------------------- */
+// Kiosk: configuration comes from the URL only — no dialogs, no stored state.
+const DEFAULTS = { base: '', poll: 60, speed: 8, hold: 12 };
+
+function loadSettings() {
+  const out = Object.assign({}, DEFAULTS);
+  const q = new URLSearchParams(location.search);
+  if (q.has('base'))   out.base   = q.get('base').trim();
+  if (q.has('poll'))   out.poll   = clamp(parseFloat(q.get('poll')), 5, 3600) || out.poll;
+  if (q.has('speed'))  out.speed  = clamp(parseFloat(q.get('speed')), 0.5, 200) || out.speed;
+  const hold = parseFloat(q.get('hold'));
+  if (q.has('hold') && !isNaN(hold)) out.hold = Math.min(600, Math.max(0, hold));
+  return out;
+}
+const clamp = (v, lo, hi) => (isNaN(v) ? NaN : Math.min(hi, Math.max(lo, v)));
+
+let settings = loadSettings();
+
+/* ------------------------------ state --------------------------------- */
+const state = {
+  competition: null,            // {name,date,organizer,homepage,zerotime}
+  classes: new Map(),           // id -> {id,name,ord}
+  orgs:    new Map(),           // id -> {id,name,nat}
+  runners: new Map(),           // id -> runner (see mergeCmp)
+  teams:   new Map(),           // id -> team
+  nextDiff: 'zero',
+  lastUpdate: 0,                // epoch ms of last successful fetch
+  ok: false,                    // last fetch succeeded
+  inFlight: false,
+};
+
+/* --------------------------- formatting -------------------------------- */
+// running time in tenths -> "1:32:14" / "8:05(.d)"
+function fmtTenths(t) {
+  if (t == null || t <= 0) return '–';
+  const s = Math.floor(t / 10), d = ((t % 10) + 10) % 10;
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  let out = h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+              : `${m}:${String(sec).padStart(2, '0')}`;
+  if (d && t >= 100) out += '.' + d;      // show tenths for times ≥ 10 s
+  return out;
+}
+// absolute tenths after midnight -> "10:30" / "1D 04:12"
+function fmtClock(t) {
+  if (t == null || t <= 0) return '–';
+  const total = Math.round(t / 10);
+  const days = Math.floor(total / 86400), s = total % 86400;
+  const hh = String(Math.floor(s / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  return (days ? days + 'D ' : '') + hh + ':' + mm;
+}
+// delta in tenths -> "+4:12"
+function fmtDelta(t) {
+  if (t == null || t <= 0) return '';
+  const s = Math.round(t / 10);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return '+' + (h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+                  : `${m}:${String(sec).padStart(2, '0')}`);
+}
+
+/* --------------------------- MOP merging -------------------------------- */
+const BOOL_ATTRS = new Set(['prel', 'competing']);
+const BASE_INT_ATTRS = ['org', 'cls', 'stat', 'st', 'rt', 'crs'];
+
+function parseAttr(el, name) {
+  const v = el.getAttribute(name);
+  return v == null ? undefined : (BOOL_ATTRS.has(name) ? v === 'true' : parseInt(v, 10));
+}
+
+function resetWorld() {
+  state.competition = null;
+  state.classes.clear(); state.orgs.clear(); state.runners.clear(); state.teams.clear();
+}
+
+function mergeCmp(el) {
+  const id = parseAttr(el, 'id');
+  if (id == null || isNaN(id)) return;
+  if (el.getAttribute('delete') === 'true') { state.runners.delete(id); return; }
+
+  let r = state.runners.get(id);
+  if (!r) r = state.runners.set(id, { id, name: '', base: {}, radio: [], input: null, competing: false }).get(id);
+
+  // the base attributes live on the <base> child element of <cmp>
+  const src = el.querySelector('base') || el;
+  for (const a of BASE_INT_ATTRS) { const v = parseAttr(src, a); if (!isNaN(v)) r.base[a] = v; }
+  for (const a of ['bib', 'nat']) { const v = src.getAttribute(a); if (v != null) r.base[a] = v; }
+  const prel = parseAttr(src, 'prel'); if (!isNaN(prel)) r.base.prel = prel;
+  const card = el.getAttribute('card'); if (card != null) r.card = parseInt(card, 10);
+  if (el.getAttribute('competing') === 'true') r.competing = true;
+  const nm = (src.textContent || '').trim();
+  if (nm) r.name = nm;   // src is <base>; diff elements may carry no name — keep the old one
+
+  for (const child of el.children) {
+    const tag = child.tagName.toLowerCase();
+    if (tag === 'radio' && child.textContent.trim()) {
+      r.radio = child.textContent.split(';').filter(s => s).map(pair => {
+        const [c, t] = pair.split(','); return { ctrl: parseInt(c, 10), t: parseInt(t, 10) };
+      }).filter(x => !isNaN(x.t));
+    } else if (tag === 'input') {
+      r.input = { it: parseAttr(child, 'it'), tstat: parseAttr(child, 'tstat') };
+    }
+  }
+
+}
+
+function mergeTeam(el) {
+  const id = parseAttr(el, 'id');
+  if (id == null || isNaN(id)) return;
+  if (el.getAttribute('delete') === 'true') { state.teams.delete(id); return; }
+  let t = state.teams.get(id);
+  if (!t) t = state.teams.set(id, { id, name: '', base: {}, legs: [] }).get(id);
+
+  const base = el.querySelector('base');
+  if (base) {
+    for (const a of BASE_INT_ATTRS) { const v = parseAttr(base, a); if (!isNaN(v)) t.base[a] = v; }
+    for (const a of ['bib', 'nat']) { const v = base.getAttribute(a); if (v != null) t.base[a] = v; }
+    const prel = parseAttr(base, 'prel'); if (!isNaN(prel)) t.base.prel = prel;
+    const nm = (base.textContent || '').trim();
+    if (nm) t.name = nm;
+  }
+  const rEl = el.querySelector('r');
+  if (rEl && rEl.textContent.trim()) {
+    t.legs = rEl.textContent.split(';').filter(s => s)
+      .map(leg => leg.split(',').map(x => parseInt(x, 10)).filter(x => !isNaN(x)));
+  }
+}
+
+function applyMOP(root) {
+  const isComplete = root.tagName.toLowerCase() === 'mopcomplete';
+  if (isComplete) resetWorld();
+  for (const el of root.children) {
+    const tag = el.tagName.toLowerCase();
+    switch (tag) {
+      case 'competition':
+        state.competition = {
+          name: (el.textContent || '').trim(),
+          date: el.getAttribute('date'), organizer: el.getAttribute('organizer'),
+          homepage: el.getAttribute('homepage') || '', zerotime: el.getAttribute('zerotime'),
+        };
+        break;
+      case 'cls':   { const id = parseAttr(el, 'id'); if (!isNaN(id)) {
+                        if (el.getAttribute('delete') === 'true') state.classes.delete(id);
+                        else state.classes.set(id, { id, name: (el.textContent||'').trim(), ord: parseAttr(el,'ord') || 0 }); }
+                     } break;
+      case 'org':   { const id = parseAttr(el, 'id'); if (!isNaN(id)) {
+                        if (el.getAttribute('delete') === 'true') state.orgs.delete(id);
+                        else state.orgs.set(id, { id, name: (el.textContent||'').trim(), nat: el.getAttribute('nat') || '' }); }
+                     } break;
+      case 'ctrl':  break;   // not needed for result display
+      case 'cmp':   mergeCmp(el); break;
+      case 'tm':    mergeTeam(el); break;
+    }
+  }
+  const nd = root.getAttribute('nextdifference');
+  if (nd) state.nextDiff = nd;
+}
+
+/* --------------------- entries, ranking, rendering ---------------------- */
+// total time incl. previous stages/legs when present
+function effectiveTime(e) {
+  let rt = e.base.rt || 0;
+  if (e.input && (e.input.it || 0) > 0) rt += e.input.it;
+  return rt;
+}
+
+const STATUS_RANK = { 2: 0, 3: 1, 6: 2, 4: 3, 15: 4, 5: 5, 20: 6, 21: 7, 99: 8 };
+const STATUS_LABEL = { 2: 'NT', 3: 'MP', 4: 'DNF', 5: 'DQ', 15: 'OCC', 20: 'DNS', 21: 'CANCEL', 99: 'NP' };
+
+// returns array of display rows for one class
+function buildEntries(clsId) {
+  const hasTeams = [...state.teams.values()].some(t => t.base.cls === clsId);
+  let raw;
+  if (hasTeams) {
+    raw = [...state.teams.values()]
+      .filter(t => t.base.cls === clsId)
+      .map(t => ({ id: 'tm' + t.id, key: t.id, isTeam: true, e: t }));
+  } else {
+    raw = [...state.runners.values()]
+      .filter(r => r.base.cls === clsId)
+      .map(r => ({ id: 'r' + r.id, key: r.id, isTeam: false, e: r }));
+  }
+
+  const rows = raw.map(x => {
+    const b = x.e.base;
+    const rt = effectiveTime(x.e);
+    return {
+      ...x, name: x.e.name || (x.isTeam ? 'team ' + x.e.id : '#' + x.e.id),
+      orgName: state.orgs.get(b.org)?.name ?? '',
+      bib: b.bib != null && b.bib !== '' ? String(b.bib) : '',
+      stat: isNaN(b.stat) ? 0 : b.stat,
+      st: b.st || null, rt: (rt > 0 ? rt : null),
+      prel: !!b.prel, competing: !!(x.e.competing) && (!hasTeams),
+      members: x.isTeam ? teamMembersText(x.e) : '',
+    };
+  });
+
+  // MOP place algorithm: sort (status group, running time); timed runners get
+  // their position in the sorted list; equal times share a place.
+  const placed = rows.filter(r => (r.stat === 1 || r.stat === 6) && r.rt).sort((a, b) => a.rt - b.rt);
+  let place = 0, lastT = null;
+  for (const r of placed) {
+    if (lastT !== null && r.rt === lastT) { /* same place */ } else { place++; lastT = r.rt; }
+    r.place = place;
+  }
+  const rest = rows.filter(r => !placed.includes(r)).sort((a, b) =>
+    ((STATUS_RANK[a.stat] ?? 9) - (STATUS_RANK[b.stat] ?? 9)) || a.name.localeCompare(b.name));
+  // unknown / in-forest last, preserving stable order
+  const forest = rest.filter(r => r.stat === 0);
+  const notok  = rest.filter(r => r.stat !== 0).sort((a, b) =>
+    ((STATUS_RANK[a.stat] ?? 9) - (STATUS_RANK[b.stat] ?? 9)) || a.name.localeCompare(b.name));
+
+  const best = placed.length ? placed[0].rt : null;
+  for (const r of [...placed, ...notok, ...forest]) {
+    r.after = (r.rt && best && r.rt > best) ? fmtDelta(r.rt - best) : '';
+    if (!placed.includes(r)) r.place = (STATUS_LABEL[r.stat] || '');
+  }
+  return { rows: [...placed, ...notok, ...forest], placedCount: placed.length };
+}
+
+function teamMembersText(team) {
+  const names = team.legs.map(leg => leg.map(id => state.runners.get(id)?.name || '?').join(' · '));
+  if (!names.length) return '';
+  if (names.length === 1) return names[0];
+  return names.map((n, i) => `L${i + 1}: ${n}`).join('   ');
+}
+
+/* ------------------------- DOM reconciliation -------------------------- */
+const resultsEl = document.getElementById('results');
+const emptyEl = document.getElementById('empty');
+const sectionsByCls = new Map();   // clsId -> {section, body, h2count}
+let anyDataRendered = false;
+
+function makeRow(row) {
+  const tr = document.createElement('tr');
+  tr.classList.add('row');
+  tr.dataset.id = row.id;
+  const tds = ['place', 'startcol', 'bib', 'name', 'club', 'time', 'after'].map(() => {
+    const td = document.createElement('td'); return td;
+  });
+  tds[0].className = 'num place'; tds[1].className = 'num startcol'; tds[2].className = 'num bib';
+  tds[3].className = 'name'; tds[4].className = 'club'; tds[5].className = 'num time'; tds[6].className = 'num after';
+  tr.append(...tds);
+  return { tr, tds };
+}
+
+function patchRow(holder, row) {
+  const set = (el, text) => { if (el.textContent !== text) el.textContent = text; };
+  const isForest = !row.rt && !!row.competing;
+  holder.tr.classList.toggle('prel', !!row.prel);
+  holder.tr.classList.toggle('forest', isForest);
+  holder.tr.classList.toggle('unk', !isForest && !row.rt && !row.place);
+  set(holder.tds[0], String(row.place));
+  holder.tds[0].classList.toggle('status', !/^\d+$/.test(String(row.place)));
+  set(holder.tds[1], fmtClock(row.st));
+  set(holder.tds[2], row.bib);
+  // name cell (with optional members line for teams) — rebuild only when it changed
+  const full = row.name + (row.prel ? ' *' : '');
+  if (holder._nameText !== full || holder._membersText !== row.members) {
+    const nameEl = holder.tds[3];
+    nameEl.textContent = '';
+    nameEl.appendChild(document.createTextNode(full));
+    if (row.members) {
+      const m = document.createElement('span');
+      m.className = 'members'; m.textContent = row.members;
+      nameEl.appendChild(m);
+    }
+    holder._nameText = full; holder._membersText = row.members || '';
+  }
+  set(holder.tds[4], row.orgName || '–');
+  const timeText = row.rt ? fmtTenths(row.rt) : (row.stat === 6 ? 'OT' : '–');
+  set(holder.tds[5], timeText);
+  set(holder.tds[6], row.after);
+}
+
+function render() {
+  // classes sorted by ord, then name
+  const clsList = [...state.classes.values()].sort((a, b) => (a.ord - b.ord) || a.name.localeCompare(b.name));
+  if (!clsList.length) {
+    emptyEl.style.display = '';
+    const m = document.getElementById('emptyMsg');
+    if (state.ok && state.competition)
+      m.textContent = `Connected — "${state.competition.name}" has no classes yet. Nothing to scroll until the start list exists.`;
+    else if (state.ok)
+      m.textContent = 'Connected, but no competition data received yet.';
+    else
+      m.innerHTML = `Waiting for data from <b>${escapeHtml(normalizeBase(settings.base))}</b> — in MeOS make sure<br>
+                     <b>Services → Information Server</b> is started (note its port), the firewall allows it,<br>
+                     and a competition with classes is open. Retrying every ${settings.poll} s.`;
+    return;
+  }
+  emptyEl.style.display = 'none';
+  anyDataRendered = true;
+
+  const used = new Set();
+  for (const cls of clsList) {
+    let holder = sectionsByCls.get(cls.id);
+    if (!holder) {
+      const section = document.createElement('section');
+      section.className = 'cls';
+      const h2 = document.createElement('h2');
+      h2.className = 'clshead';
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const trh = document.createElement('tr');
+      for (const [label, cls] of [['', 'num place'], ['Start', 'num startcol'], ['Bib', 'num bib'],
+                                  ['Name', 'namehead'], ['Club', 'club clubhead'], ['Time', 'num timehead'], ['After', 'num afterhead']]) {
+        const th = document.createElement('th'); if (cls) th.className = cls; th.textContent = label; trh.appendChild(th);
+      }
+      thead.appendChild(trh);
+      const tbody = document.createElement('tbody');
+      table.append(thead, tbody);
+      section.append(h2, table);
+      resultsEl.appendChild(section);
+      holder = sectionsByCls.set(cls.id, { section, h2, body: tbody, nameEl: null }).get(cls.id);
+    }
+    used.add(cls.id);
+
+    // class header text (set each render — cheap)
+    const { rows, placedCount } = buildEntries(cls.id);
+    holder.h2.firstChild?.remove();
+    holder.h2.insertAdjacentText('afterbegin', cls.name || ('class ' + cls.id));
+    let cnt = holder.h2.querySelector('.count');
+    if (!cnt) { cnt = document.createElement('span'); cnt.className = 'count'; holder.h2.appendChild(cnt); }
+    cnt.textContent = `${placedCount} finished · ${rows.length} total`;
+
+    // reconcile rows: keep existing <tr> per runner id, move/patch in place
+    const holders = new Map();
+    for (const tr of [...holder.body.children]) holders.set(tr.dataset.id, { tr });
+    // build holder objects with tds refs once
+    const rowHolders = new Map();
+    for (const [id, h] of holders) {
+      h.tds = [...h.tr.children];
+      if (!h.tds.length || !h.tr.classList.contains('row')) continue;  // skip strays
+      rowHolders.set(id, h);
+    }
+    const seen = new Set();
+    for (const row of rows) {
+      let rh = rowHolders.get(row.id);
+      if (!rh) {
+        const created = makeRow(row);
+        holder.body.appendChild(created.tr);
+        rh = { tr: created.tr, tds: created.tds };
+      }
+      seen.add(row.id);
+      patchRow(rh, row);
+      holder.body.appendChild(rh.tr);   // reorder to desired position (no-op if already there)
+    }
+    for (const [id] of holders) if (!seen.has(id)) {
+      const h = rowHolders.get(id);
+      if (h) h.tr.remove(); else [...holder.body.children].find(tr => tr.dataset.id === id)?.remove();
+    }
+  }
+  // remove sections for vanished classes
+  for (const [clsId, holder] of sectionsByCls) {
+    if (!used.has(clsId)) { holder.section.remove(); sectionsByCls.delete(clsId); }
+  }
+}
+
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+/* ------------------------------- polling -------------------------------- */
+function normalizeBase(b) {
+  b = (b || '').trim();
+  if (!b) return '';
+  if (!/^https?:\/\//i.test(b)) b = 'http://' + b;
+  try { const u = new URL(b); let p = u.pathname.replace(/\/+$/, ''); if (p.endsWith('/meos')) p = p.slice(0, -5); return u.origin + p; }
+  catch (e) { return b.replace(/\/+$/, '').replace(/\/meos$/i, ''); }
+}
+
+async function tick() {
+  if (!settings.base || state.inFlight) return false;
+  state.inFlight = true;
+  const url = `${normalizeBase(settings.base)}/meos?difference=${encodeURIComponent(state.nextDiff)}`;
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 20000);
+    const resp = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+    clearTimeout(to);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const text = await resp.text();
+    // MeOS answers errors as plain text ("Error (MeOS): …") — surface it verbatim
+    if (!/^\s*</.test(text)) throw new Error((text || 'empty response').trim().slice(0, 160));
+    const doc = new DOMParser().parseFromString(text, 'text/xml');
+    if (doc.querySelector('parsererror')) throw new Error('unparseable XML response');
+    applyMOP(doc.documentElement);
+    state.lastUpdate = Date.now();
+    state.ok = true;
+    hideBanner();
+    render();
+    return true;
+  } catch (err) {
+    // MeOS answers this when its instance state is gone (restart, evicted stream):
+    // re-bootstrap with a full fetch on the next poll.
+    if (/Unknown difference state/i.test(err.message)) state.nextDiff = 'zero';
+
+    state.ok = false;
+    showBanner(`Cannot get results from ${escapeHtml(normalizeBase(settings.base))} — ${escapeHtml(err.message)}. Retrying every ${settings.poll} s.`);
+    if (!anyDataRendered) render();   // keep the empty-state hint up to date
+    return false;
+  } finally { state.inFlight = false; }
+}
+
+let pollTimer = null;
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(tick, settings.poll * 1000);
+  tick();       // immediate
+}
+
+/* ------------------------------ banner ---------------------------------- */
+const bannerEl = document.getElementById('banner');
+function showBanner(html) { bannerEl.innerHTML = html; bannerEl.classList.add('show'); }
+function hideBanner() { bannerEl.classList.remove('show'); }
+
+/* ---------------------------- auto scroll engine ------------------------- */
+const scroller = { paused: false, phase: 'scroll', phaseEnd: 0,
+                   resetFrom: 0, lastT: null, vy: null };
+// Note: scroll position is accumulated as a float (scroller.vy). Browsers truncate
+// scrollTop to whole pixels — at slow speeds (e.g. 8 px/s) the per-frame increment is
+// < 1px and recomputing from window.scrollY every frame would never move at all.
+// Kiosk mode: nothing pauses the scroll except the page being hidden (tab/background).
+document.addEventListener('visibilitychange', () => { scroller.paused = document.hidden; });
+
+function frame(t) {
+  try { _frameBody(t); } catch (err) { console.error('[meos-live] scroll engine error:', err); }
+  requestAnimationFrame(frame);   // always reschedule — one bad frame must not kill the loop
+}
+function _frameBody(t) {
+  const dt = scroller.lastT == null ? 0 : Math.min(0.1, (t - scroller.lastT) / 1000);
+  scroller.lastT = t;
+  const docEl = document.documentElement;
+  const maxScroll = Math.max(0, docEl.scrollHeight - innerHeight);
+
+  if (!scroller.paused && anyDataRendered) {
+
+    if (scroller.phase === 'scroll') {
+      // adopt manual/external scroll changes, then keep accumulating on top
+      if (scroller.vy == null || Math.abs(scrollY - scroller.vy) > 2) scroller.vy = scrollY;
+      const y = Math.min(maxScroll, scroller.vy + settings.speed * dt);
+      scroller.vy = y;
+      scrollTo(0, y);
+      // bottom reached — or the page is shorter than one viewport
+      if (maxScroll <= 4 || y >= maxScroll - 1) {
+        scroller.phase = 'hold';
+        scroller.phaseEnd = t + settings.hold * 1000;
+      }
+    } else if (scroller.phase === 'hold') {
+      if (t >= scroller.phaseEnd) {
+        tick();                            // the "refresh" at lap end
+        scroller.phase = 'reset';
+        scroller.resetFrom = scrollY;
+        scroller.phaseEnd = t;             // reset start time
+      }
+    } else if (scroller.phase === 'reset') {
+      const p = Math.min(1, (t - scroller.phaseEnd) / 2500);
+      const ease = p < .5 ? 4 * p ** 3 : 1 - (-2 * p + 2) ** 3 / 2;
+
+      scrollTo(0, scroller.resetFrom * (1 - ease));
+      if (p >= 1) { scroller.phase = 'scroll'; scroller.vy = 0; }
+    }
+  }
+
+
+
+  // kiosk: no progress bar / status line — just keep scrolling.
+  if (!warnedShortPage && anyDataRendered && maxScroll <= 4) {
+    warnedShortPage = true;
+    console.warn('[meos-live] page is shorter than the viewport — nothing to scroll yet.');
+  }
+}
+let warnedShortPage = false;
+requestAnimationFrame(function boot(t) { scroller.lastT = t; requestAnimationFrame(frame); });
+console.info('[meos-live] base=' + (settings.base || '(none)') + ' poll=' + settings.poll +
+             's speed=' + settings.speed + 'px/s hold=' + settings.hold + 's');
+
+/* --------------------------------- boot ---------------------------------- */
+if (settings.base) {
+  startPolling();
+} else {
+  document.getElementById('emptyMsg').innerHTML =
+    'No MeOS server configured.<br><br>Open this page with a <b>?base=</b> parameter, e.g.<br>' +
+    '<code style="font-size:18px">meos-live.html?base=http://HOST-IP:2009</code>';
+}
+</script>
+</body>
+</html>
